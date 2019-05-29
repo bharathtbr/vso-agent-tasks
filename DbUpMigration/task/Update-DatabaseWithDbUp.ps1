@@ -2,21 +2,15 @@ function Get-TempDir {
     return $env:LOCALAPPDATA
 }
 
-function Get-ResolvedPaths {
-    param($rootDir)
-    $patterns = @();
-    $patterns += 'dbup-core*\lib\net35\*.dll'
-    $patterns += 'dbup-sqlserver*\lib\net35\*.dll'
-    $patterns += 'System.Data.SqlClient.*\lib\netstandard1.3\*.dll'
-    $patterns | ForEach-Object { Resolve-Path (Join-Path $rootDir $_) -ErrorAction SilentlyContinue } | Select-Object -ExpandProperty Path
-}
-
 function Get-DllPaths {
-    $tempDir = Join-Path (Get-TempDir) 'DatabaseMigration'
-    $paths = @(Get-ResolvedPaths $tempDir)
-    if ($paths.Length -ne 3) {
-        $localDir = Join-Path $PSScriptRoot 'lib'
-        $paths = @(Get-ResolvedPaths $localDir)
+    $workingDir = Join-Path (Get-TempDir) 'DatabaseMigration'
+    $dllFilePattern = Join-Path $workingDir 'dbup.*\lib\net35\DbUp.dll'
+    $paths = @()
+    if ((Test-Path $dllFilePattern)) {
+        $paths += Resolve-Path $dllFilePattern | Select-Object -ExpandProperty Path -First 1
+    }
+    else {
+        $paths += Join-Path $PSScriptRoot 'lib\dbup.3.3.5\lib\net35\DbUp.dll'
     }
     return $paths
 }
@@ -69,7 +63,6 @@ using System.Linq;
 using System.Text;
 using DbUp.Engine;
 using DbUp.Engine.Transactions;
-using DbUp.Support;
 
 public enum FileSearchOrder
 {
@@ -97,7 +90,6 @@ public class FileSystemScriptProvider : IScriptProvider
     private readonly Func<string, bool> filter;
     private readonly Encoding encoding;
     private FileSystemScriptOptions options;
-    private int nextRunGroupOrder = 1;
 
     public FileSystemScriptProvider(string directoryPath):this(directoryPath, new FileSystemScriptOptions())
     {
@@ -137,12 +129,7 @@ public class FileSystemScriptProvider : IScriptProvider
         using (FileStream fileStream = new FileStream(file.FullName, FileMode.Open, FileAccess.Read))
         {
             var fileName = file.FullName.Substring(directoryPath.Length + 1);
-            var options = new SqlScriptOptions()
-            {
-                ScriptType = ScriptType.RunOnce,
-                RunGroupOrder = this.nextRunGroupOrder++
-            };
-            return SqlScript.FromStream(fileName, fileStream, encoding, options);
+            return SqlScript.FromStream(fileName, fileStream, encoding);
         }
     }
 
@@ -164,23 +151,7 @@ function Write-Information {
     param($message) Write-Host $message
 }
 
-function New-SchemaIfNotExists {
-    # Work around for https://github.com/DbUp/DbUp/issues/346
-    param($ConnectionString, $SchemaName)
-    if ($SchemaName -eq 'dbo') {
-        return
-    }
-    $query = "IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'$SchemaName') EXEC(N'CREATE SCHEMA [$SchemaName]')"
-    # PowerShell versions makes Invoke-Sqlcmd with -ConnectionString unreliable.
-    $connection = New-Object System.Data.SqlClient.SqlConnection -ArgumentList $ConnectionString
-    $connection.Open()
-    $cmd = New-Object System.Data.SqlClient.SqlCommand -ArgumentList $query, $connection
-    $cmd.ExecuteNonQuery()
-    $cmd.Dispose()
-    $connection.Dispose()
-}
-
-[Action[string]]$infoDelegate = { param($message) Write-Information $message }
+[Action[string]]$infoDelegate = {param($message) Write-Information $message}
 
 function Update-DatabaseWithDbUp {
     param(
@@ -191,8 +162,7 @@ function Update-DatabaseWithDbUp {
         [string]$Encoding = "Default",
         [ValidateSet('NoTransactions', 'TransactionPerScript', 'SingleTransaction')]
         [string]$TransactionStrategy = 'TransactionPerScript',
-        [string]$JournalSchemaName = 'dbo',
-        [string]$JournalTableName = '_SchemaVersions',
+        [string]$JournalName = '_SchemaVersions',
         [ValidateSet('LogScriptOutput', 'Quiet')]
         [string]$Logging = 'Quiet',
         [ValidateSet('SearchAllFolders', 'SearchTopFolderOnly')]
@@ -248,8 +218,7 @@ function Update-DatabaseWithDbUp {
         $dbUp = [StandardExtensions]::JournalTo($dbUp, (New-Object DbUp.Helpers.NullJournal))
     }
     else {
-        New-SchemaIfNotExists -SchemaName $JournalSchemaName -ConnectionString $ConnectionString
-        $dbUp = [SqlServerExtensions]::JournalToSqlTable($dbUp, $JournalSchemaName, $JournalTableName)
+        $dbUp = [SqlServerExtensions]::JournalToSqlTable($dbUp, 'dbo', $JournalName)
     }
     $dbUp.Configure($configFunc)
     if ($VariableSubstitution) {
@@ -267,7 +236,7 @@ function Update-DatabaseWithDbUp {
     $result = $dbUp.Build().PerformUpgrade()
     if (!$result.Successful) {
         $errorMessage = ""
-        if ($null -ne $result.Error) {
+        if ($result.Error -ne $null) {
             $errorMessage = $result.Error.Message
         }
         Write-Information "##vso[task.logissue type=error;]Database migration failed. $errorMessage"
